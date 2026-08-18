@@ -655,7 +655,8 @@ function runFakeInstaller(packageName) {
 
 // --- WHOAMI ---------------------------------------------------------------
 registerCommand(["whoami"], () => {
-  printLine(isElevated ? "lera (elevated)" : "lera");
+  const name = loggedInUsername || "lera";
+  printLine(isElevated ? `${name} (elevated)` : name);
 });
 
 // --- VERSION (ver / uname) --------------------------------------------------
@@ -1211,6 +1212,29 @@ function runCommand(line) {
   handler(args);
 }
 
+// Makes sure C:\Users\<username> exists and becomes the working
+// directory, regardless of who's logged in. If this is the very
+// first login and the filesystem still has the placeholder "lera"
+// folder from defaultFilesystem(), we rename it (keeping its
+// contents) rather than leaving a stray folder with the wrong name.
+function ensureUserHome(username) {
+  const usersNode = resolveNode(["C:", "Users"]);
+  if (!usersNode || usersNode.type !== "dir") return;
+
+  if (!usersNode.children[username]) {
+    if (usersNode.children["lera"] && Object.keys(usersNode.children).length === 1) {
+      // Only the untouched placeholder exists — migrate it.
+      usersNode.children[username] = usersNode.children["lera"];
+      delete usersNode.children["lera"];
+    } else {
+      usersNode.children[username] = { type: "dir", children: {} };
+    }
+    saveFilesystem();
+  }
+
+  cwdPath = ["C:", "Users", username];
+}
+
 // ---------------------------------------------------------------
 // 7. BOOT SEQUENCE + TERMINAL WIRING
 // ---------------------------------------------------------------
@@ -1307,6 +1331,7 @@ function askNewPassword() {
       saveUser(pendingUsername, pendingPassword);
       loggedInUsername = pendingUsername;
       shellMode = "normal";
+      ensureUserHome(pendingUsername);
       printLine(`Account created. Welcome, ${pendingUsername}.`, "info");
       printLine("");
       offerOperatorInstall();
@@ -1334,6 +1359,7 @@ function startLogin(account) {
     }
     loggedInUsername = account.username;
     shellMode = "normal";
+    ensureUserHome(account.username);
     printLine("Login successful.", "info");
     printLine("");
     printLine("Type HELP to see available commands.", "info");
