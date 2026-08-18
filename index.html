@@ -1,0 +1,1389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WASDOS</title>
+<style>
+  /* ============================================================
+     WASDOS — visual style
+     Green-on-black CRT terminal look, monospace everywhere.
+     ============================================================ */
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #000;
+    color: #33ff33;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 16px;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  #screen {
+    height: 100vh;
+    box-sizing: border-box;
+    padding: 12px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  #inputLine {
+    display: flex;
+    align-items: center;
+  }
+
+  #prompt {
+    white-space: pre;
+    color: #33ff33;
+  }
+
+  #cmdInput {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #33ff33;
+    font-family: inherit;
+    font-size: inherit;
+    caret-color: #33ff33;
+    margin-left: 4px;
+  }
+
+  .err { color: #ff5555; }
+  .info { color: #55ffff; }
+  .warn { color: #ffff55; }
+
+  /* --- App overlay: full-screen iframe window for installed apps --- */
+  #appOverlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: #000;
+    z-index: 1000;
+    flex-direction: column;
+  }
+  #appTitleBar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #111;
+    color: #33ff33;
+    border-bottom: 1px solid #33ff33;
+    padding: 6px 10px;
+    font-size: 14px;
+  }
+  #appCloseBtn {
+    background: #222;
+    color: #ff5555;
+    border: 1px solid #ff5555;
+    font-family: inherit;
+    cursor: pointer;
+    padding: 2px 10px;
+  }
+  #appFrame {
+    flex: 1;
+    border: none;
+    background: #fff;
+  }
+</style>
+</head>
+<body>
+
+<div id="screen"></div>
+
+<div id="appOverlay">
+  <div id="appTitleBar">
+    <span id="appTitleText">App</span>
+    <button id="appCloseBtn">X close (Esc)</button>
+  </div>
+  <iframe id="appFrame" sandbox="allow-scripts allow-forms allow-pointer-lock"></iframe>
+</div>
+
+<script>
+/* ============================================================
+   WASDOS CORE
+   A browser-based hybrid DOS/Linux command shell.
+
+   Structure of this file:
+   1. Virtual Filesystem (VFS)
+   2. Process table (fake, for tasklist/ps)
+   3. Command registry — every command has a canonical handler,
+      and both its DOS alias and Linux alias point to it.
+   4. Shell — parses input, resolves paths, runs commands.
+   5. Boot sequence + terminal wiring.
+
+   Everything is heavily commented since this is a from-scratch
+   learning project — read top to bottom, it should make sense
+   even without prior JS experience.
+   ============================================================ */
+
+// ---------------------------------------------------------------
+// 1. VIRTUAL FILESYSTEM
+// ---------------------------------------------------------------
+// The whole filesystem is one JS object tree. Each folder has
+// `type: "dir"` and a `children` object keyed by name. Each file
+// has `type: "file"` and a `content` string.
+//
+// We persist this to localStorage so it survives page reloads —
+// this is safe here because WASDOS runs as a real deployed site
+// in the browser, not inside a Claude artifact sandbox.
+
+const FS_STORAGE_KEY = "wasdos_fs_v1";
+
+function defaultFilesystem() {
+  return {
+    type: "dir",
+    children: {
+      "C:": {
+        type: "dir",
+        children: {
+          "README.txt": {
+            type: "file",
+            content: "Welcome to WASDOS.\nType HELP or help to see available commands.\n"
+          },
+          "SYSTEM": {
+            type: "dir",
+            children: {
+              "kernel.sys": { type: "file", content: "[fake kernel image]" }
+            }
+          },
+          "Users": {
+            type: "dir",
+            children: {
+              "lera": {
+                type: "dir",
+                children: {
+                  "notes.txt": { type: "file", content: "TODO: build the rest of WASDOS.\n" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+}
+
+let fs = loadFilesystem();
+
+function loadFilesystem() {
+  try {
+    const raw = localStorage.getItem(FS_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    // If storage is corrupted, fall through to a fresh FS.
+  }
+  return defaultFilesystem();
+}
+
+function saveFilesystem() {
+  try {
+    localStorage.setItem(FS_STORAGE_KEY, JSON.stringify(fs));
+  } catch (e) {
+    printLine("warn: could not save filesystem to localStorage", "warn");
+  }
+}
+
+// Current working directory, stored as an array of path segments.
+// e.g. ["C:", "Users", "lera"]
+let cwdPath = ["C:", "Users", "lera"];
+
+// Resolve a path array to the actual node object in the FS tree.
+function resolveNode(pathArr) {
+  let node = fs;
+  for (const segment of pathArr) {
+    if (!node.children || !node.children[segment]) return null;
+    node = node.children[segment];
+  }
+  return node;
+}
+
+// Turn a path array into a display string like C:\Users\lera
+function pathToString(pathArr) {
+  return pathArr.join("\\");
+}
+
+// Resolve a user-typed path (relative or absolute, DOS or Unix
+// slashes) against the current directory, returning a new path array.
+function resolvePathInput(input) {
+  if (!input || input === ".") return [...cwdPath];
+
+  // Normalize slashes: both / and \ are accepted.
+  const normalized = input.replace(/\//g, "\\");
+  const isAbsolute = /^[A-Za-z]:/.test(normalized);
+
+  let base = isAbsolute ? [] : [...cwdPath];
+  const parts = normalized.split("\\").filter(p => p.length > 0);
+
+  for (const part of parts) {
+    if (part === "..") {
+      base.pop();
+    } else if (part === ".") {
+      // no-op
+    } else {
+      base.push(part);
+    }
+  }
+  return base;
+}
+
+// ---------------------------------------------------------------
+// 1b. USER ACCOUNT (local-only, first-run registration)
+// ---------------------------------------------------------------
+// Not real security — this is a single-player local terminal, so
+// the "password" is just stored in localStorage in the clear.
+// It exists purely for the DOS-boot-screen roleplay of having a
+// username/password gate on first run.
+
+const USER_STORAGE_KEY = "wasdos_user_v1";
+
+function loadUser() {
+  try {
+    const raw = localStorage.getItem(USER_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return null;
+}
+
+function saveUser(username, password) {
+  try {
+    localStorage.setItem(USER_STORAGE_KEY, JSON.stringify({ username, password }));
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------
+// 2. FAKE PROCESS TABLE
+// ---------------------------------------------------------------
+// Not real OS processes — just a list so tasklist/ps have
+// something to show. Later this can back real "programs".
+
+let processTable = [
+  { pid: 1, name: "wasdos_kernel" },
+  { pid: 2, name: "shell" }
+];
+let nextPid = 3;
+
+// ---------------------------------------------------------------
+// 2b. INSTALLED APPS
+// ---------------------------------------------------------------
+// Apps are just HTML documents (games, tools, whatever) that get
+// pulled in by URL and stored as raw HTML text. "Installing" one
+// just means fetching it once and saving the source so it can be
+// launched offline afterward via `run`.
+//
+// Registry shape: { name: { url, html, installedAt } }
+
+const APPS_STORAGE_KEY = "wasdos_apps_v1";
+
+function loadApps() {
+  try {
+    const raw = localStorage.getItem(APPS_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return {};
+}
+
+function saveApps() {
+  try {
+    localStorage.setItem(APPS_STORAGE_KEY, JSON.stringify(appRegistry));
+  } catch (e) {
+    printLine("warn: could not save app registry to localStorage", "warn");
+  }
+}
+
+let appRegistry = loadApps();
+
+// Seed one built-in demo app so `run demo` works with zero setup.
+// This is just a tiny click-counter game to prove the app pipeline
+// works end to end before you install anything real.
+if (!appRegistry["demo"]) {
+  appRegistry["demo"] = {
+    url: "(built-in)",
+    installedAt: new Date().toISOString(),
+    html: `<!DOCTYPE html><html><head><style>
+      body{margin:0;height:100vh;display:flex;flex-direction:column;
+        align-items:center;justify-content:center;background:#111;
+        color:#33ff33;font-family:monospace;}
+      button{font-family:monospace;font-size:20px;padding:10px 20px;
+        background:#000;color:#33ff33;border:2px solid #33ff33;cursor:pointer;}
+      </style></head><body>
+      <h1>WASDOS Demo App</h1>
+      <p id="count">Clicks: 0</p>
+      <button onclick="c++;document.getElementById('count').textContent='Clicks: '+c">Click me</button>
+      <script>let c = 0;<\/script>
+      </body></html>`
+  };
+  saveApps();
+}
+
+// ---------------------------------------------------------------
+// 3. SESSION STATE (sudo, etc.)
+// ---------------------------------------------------------------
+
+let isElevated = false;
+
+// ---------------------------------------------------------------
+// 4. TERMINAL OUTPUT HELPERS
+// ---------------------------------------------------------------
+
+const screenEl = document.getElementById("screen");
+
+function printLine(text, cssClass) {
+  const div = document.createElement("div");
+  if (cssClass) div.className = cssClass;
+  div.textContent = text;
+  screenEl.appendChild(div);
+  screenEl.scrollTop = screenEl.scrollHeight;
+}
+
+function printRaw(html) {
+  // Used sparingly, only for the boot sequence, since everything
+  // else should go through printLine to avoid HTML injection from
+  // file contents etc.
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  screenEl.appendChild(div);
+  screenEl.scrollTop = screenEl.scrollHeight;
+}
+
+// ---------------------------------------------------------------
+// 5. COMMAND REGISTRY
+// ---------------------------------------------------------------
+// Each entry: canonical handler function taking (args[]) and
+// returning nothing (it prints directly). We register both the
+// DOS-style name and the Linux-style name pointing at the same
+// function, so `dir` and `ls` behave identically.
+
+const commands = {};
+
+function registerCommand(names, handler) {
+  for (const n of names) {
+    commands[n.toLowerCase()] = handler;
+  }
+}
+
+// --- HELP -------------------------------------------------------
+registerCommand(["help", "?"], () => {
+  printLine("WASDOS — hybrid DOS/Linux shell. Commands (DOS / Linux):");
+  printLine("  dir     / ls        list directory contents");
+  printLine("  cd      / cd        change directory");
+  printLine("  type    / cat       print file contents");
+  printLine("  copy    / cp        copy a file");
+  printLine("  del     / rm        delete a file");
+  printLine("  md      / mkdir     make a directory");
+  printLine("  rd      / rmdir     remove a directory");
+  printLine("  cls     / clear     clear the screen");
+  printLine("  echo    / echo      print text (>> file to append)");
+  printLine("  tasklist/ ps        list fake processes");
+  printLine("  sudo    / sudo      elevate privileges for this session");
+  printLine("  whoami  / whoami    show current user");
+  printLine("  pwd     / cd (no args) show current directory");
+  printLine("  ver     / uname     show WASDOS version");
+  printLine("  grep    / grep      search inside a file for a pattern");
+  printLine("  find    / find      find files/dirs by name (recursive)");
+  printLine("  kill    / kill      kill a fake process by PID");
+  printLine("  chmod   / chmod     tag a file with a permission mode");
+  printLine("  install / apt install  install an app/game from a URL");
+  printLine("  apps    / ls-apps   list installed apps");
+  printLine("  uninstall/rm-app    remove an installed app");
+  printLine("  run     / exec      launch an installed app (Esc to close)");
+  printLine("  touch   / touch     create an empty file");
+  printLine("  mv      / move      move/rename a file");
+  printLine("  head    / head      show first N lines of a file");
+  printLine("  tail    / tail      show last N lines of a file");
+  printLine("  wc      / wc        count lines/words/chars in a file");
+  printLine("  date    / date      show current date/time");
+  printLine("  hostname/ hostname  show device hostname");
+  printLine("  history / history   list previously run commands");
+  printLine("  man     / man       show help for a command");
+  printLine("  wget    / wget      download a URL into a file");
+  printLine("  curl    / curl      fetch a URL (print, or -o to save)");
+  printLine("  gdown   / gdown     download from a Google Drive link/ID");
+  printLine("  run v86 wasdos-operator.sh   boot a real x86 VM (v86, FreeDOS) in-browser");
+});
+
+// --- LIST DIRECTORY (dir / ls) -----------------------------------
+registerCommand(["dir", "ls"], (args) => {
+  const targetPath = args[0] ? resolvePathInput(args[0]) : cwdPath;
+  const node = resolveNode(targetPath);
+  if (!node || node.type !== "dir") {
+    printLine(`The system cannot find the path specified: ${args[0] || pathToString(targetPath)}`, "err");
+    return;
+  }
+  printLine(` Directory of ${pathToString(targetPath)}`);
+  printLine("");
+  const entries = Object.entries(node.children || {});
+  if (entries.length === 0) {
+    printLine("  (empty)");
+  } else {
+    for (const [name, child] of entries) {
+      const tag = child.type === "dir" ? "<DIR>" : "     ";
+      printLine(`  ${tag}  ${name}`);
+    }
+  }
+  printLine("");
+});
+
+// --- CHANGE / PRINT DIRECTORY (cd / pwd) -------------------------
+registerCommand(["cd"], (args) => {
+  if (args.length === 0) {
+    printLine(pathToString(cwdPath));
+    return;
+  }
+  const newPath = resolvePathInput(args[0]);
+  const node = resolveNode(newPath);
+  if (!node || node.type !== "dir") {
+    printLine(`The system cannot find the path specified.`, "err");
+    return;
+  }
+  cwdPath = newPath;
+});
+
+registerCommand(["pwd"], () => {
+  printLine(pathToString(cwdPath));
+});
+
+// --- READ FILE (type / cat) --------------------------------------
+registerCommand(["type", "cat"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: type <file>  (or cat <file>)", "err");
+    return;
+  }
+  const target = resolvePathInput(args[0]);
+  const node = resolveNode(target);
+  if (!node || node.type !== "file") {
+    printLine(`File not found: ${args[0]}`, "err");
+    return;
+  }
+  printLine(node.content);
+});
+
+// --- MAKE DIRECTORY (md / mkdir) ----------------------------------
+registerCommand(["md", "mkdir"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: md <name>  (or mkdir <name>)", "err");
+    return;
+  }
+  const target = resolvePathInput(args[0]);
+  const name = target[target.length - 1];
+  const parentPath = target.slice(0, -1);
+  const parent = resolveNode(parentPath);
+  if (!parent || parent.type !== "dir") {
+    printLine("The system cannot find the path specified.", "err");
+    return;
+  }
+  if (parent.children[name]) {
+    printLine("A subdirectory or file already exists.", "err");
+    return;
+  }
+  parent.children[name] = { type: "dir", children: {} };
+  saveFilesystem();
+});
+
+// --- REMOVE DIRECTORY (rd / rmdir) --------------------------------
+registerCommand(["rd", "rmdir"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: rd <name>  (or rmdir <name>)", "err");
+    return;
+  }
+  const target = resolvePathInput(args[0]);
+  const name = target[target.length - 1];
+  const parentPath = target.slice(0, -1);
+  const parent = resolveNode(parentPath);
+  if (!parent || !parent.children[name] || parent.children[name].type !== "dir") {
+    printLine("The system cannot find the path specified.", "err");
+    return;
+  }
+  delete parent.children[name];
+  saveFilesystem();
+});
+
+// --- DELETE FILE (del / rm) ---------------------------------------
+registerCommand(["del", "rm"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: del <file>  (or rm <file>)", "err");
+    return;
+  }
+  // Fake "protected" files require sudo, just for flavor.
+  const target = resolvePathInput(args[0]);
+  const name = target[target.length - 1];
+  const parentPath = target.slice(0, -1);
+  const parent = resolveNode(parentPath);
+  if (!parent || !parent.children[name]) {
+    printLine(`Could not find file ${args[0]}`, "err");
+    return;
+  }
+  if (name.toLowerCase() === "kernel.sys" && !isElevated) {
+    printLine("Access denied. This operation requires elevated privileges (try: sudo del ...)", "err");
+    return;
+  }
+  delete parent.children[name];
+  saveFilesystem();
+});
+
+// --- COPY FILE (copy / cp) -----------------------------------------
+registerCommand(["copy", "cp"], (args) => {
+  if (args.length < 2) {
+    printLine("Usage: copy <source> <dest>  (or cp <source> <dest>)", "err");
+    return;
+  }
+  const srcPath = resolvePathInput(args[0]);
+  const srcNode = resolveNode(srcPath);
+  if (!srcNode || srcNode.type !== "file") {
+    printLine(`Source file not found: ${args[0]}`, "err");
+    return;
+  }
+  const destPath = resolvePathInput(args[1]);
+  const destName = destPath[destPath.length - 1];
+  const destParent = resolveNode(destPath.slice(0, -1));
+  if (!destParent || destParent.type !== "dir") {
+    printLine("The system cannot find the path specified.", "err");
+    return;
+  }
+  destParent.children[destName] = { type: "file", content: srcNode.content };
+  saveFilesystem();
+  printLine("        1 file(s) copied.");
+});
+
+// --- ECHO (echo / echo, supports >> append) -------------------------
+registerCommand(["echo"], (args) => {
+  const joined = args.join(" ");
+  const appendMatch = joined.match(/^(.*?)\s*>>\s*(\S+)$/);
+  const overwriteMatch = joined.match(/^(.*?)\s*>\s*(\S+)$/);
+
+  if (appendMatch || overwriteMatch) {
+    const match = appendMatch || overwriteMatch;
+    const text = match[1];
+    const filePath = resolvePathInput(match[2]);
+    const name = filePath[filePath.length - 1];
+    const parent = resolveNode(filePath.slice(0, -1));
+    if (!parent || parent.type !== "dir") {
+      printLine("The system cannot find the path specified.", "err");
+      return;
+    }
+    const existing = parent.children[name];
+    if (appendMatch && existing && existing.type === "file") {
+      existing.content += text + "\n";
+    } else {
+      parent.children[name] = { type: "file", content: text + "\n" };
+    }
+    saveFilesystem();
+  } else {
+    printLine(joined);
+  }
+});
+
+// --- CLEAR SCREEN (cls / clear) -------------------------------------
+registerCommand(["cls", "clear"], () => {
+  screenEl.innerHTML = "";
+});
+
+// --- TASKLIST / PS ----------------------------------------------------
+registerCommand(["tasklist", "ps"], () => {
+  printLine("PID   NAME");
+  for (const p of processTable) {
+    printLine(`${String(p.pid).padEnd(6)}${p.name}`);
+  }
+});
+
+// --- SUDO ---------------------------------------------------------------
+registerCommand(["sudo"], (args) => {
+  if (!isElevated) {
+    isElevated = true;
+    printLine("[sudo] privileges elevated for this session.", "info");
+  }
+
+  const rest = args.join(" ").toLowerCase();
+
+  // Special-cased Easter egg: pretend-install the "WASDOS operator" —
+  // purely cosmetic, just a themed progress bar for flavor.
+  if (rest === "apt-install wasdos-operator.sh" || rest === "apt install wasdos-operator.sh") {
+    runFakeInstaller("wasdos-operator.sh");
+    return;
+  }
+
+  // Otherwise, if a command follows sudo, run it with elevation active.
+  if (args.length > 0) {
+    runCommand(args.join(" "));
+  }
+});
+
+// Renders an animated ASCII progress bar over a few seconds, then
+// prints a fake "install complete" summary. Purely cosmetic.
+function runFakeInstaller(packageName) {
+  printLine(`Installing ${packageName}...`, "info");
+  const barWidth = 30;
+  let pct = 0;
+
+  // We update a single line in place by tracking the div and
+  // rewriting its textContent, rather than printing a new line
+  // every tick (which would spam the scrollback).
+  const barLine = document.createElement("div");
+  screenEl.appendChild(barLine);
+
+  const steps = [
+    "Resolving dependencies...",
+    "Fetching wasdos-operator core...",
+    "Fetching wasdos-operator drivers...",
+    "Unpacking...",
+    "Configuring...",
+    "Running post-install hooks..."
+  ];
+  let stepIndex = 0;
+
+  const interval = setInterval(() => {
+    pct = Math.min(100, pct + Math.floor(Math.random() * 12) + 5);
+    const filled = Math.round((pct / 100) * barWidth);
+    const bar = "#".repeat(filled) + "-".repeat(barWidth - filled);
+    const stepLabel = steps[Math.min(stepIndex, steps.length - 1)];
+    barLine.textContent = `[${bar}] ${pct}%  ${stepLabel}`;
+    screenEl.scrollTop = screenEl.scrollHeight;
+
+    if (pct % 20 < 12) stepIndex++;
+
+    if (pct >= 100) {
+      clearInterval(interval);
+      barLine.textContent = `[${"#".repeat(barWidth)}] 100%  Done.`;
+      printLine("");
+      printLine(`${packageName} installed successfully.`, "info");
+      printLine("WASDOS operator is now active. Try: run demo", "info");
+      printLine("");
+    }
+  }, 220);
+}
+
+// --- WHOAMI ---------------------------------------------------------------
+registerCommand(["whoami"], () => {
+  printLine(isElevated ? "lera (elevated)" : "lera");
+});
+
+// --- VERSION (ver / uname) --------------------------------------------------
+registerCommand(["ver", "uname"], () => {
+  printLine("WASDOS [Version 0.1.0] — hybrid DOS/Linux shell, running in-browser");
+});
+
+// --- GREP (search inside a file for a pattern) -------------------------------
+registerCommand(["grep"], (args) => {
+  if (args.length < 2) {
+    printLine("Usage: grep <pattern> <file>", "err");
+    return;
+  }
+  const pattern = args[0];
+  const target = resolvePathInput(args[1]);
+  const node = resolveNode(target);
+  if (!node || node.type !== "file") {
+    printLine(`File not found: ${args[1]}`, "err");
+    return;
+  }
+  const lines = node.content.split("\n");
+  let matched = false;
+  lines.forEach((l, idx) => {
+    if (l.includes(pattern)) {
+      matched = true;
+      printLine(`${idx + 1}: ${l}`);
+    }
+  });
+  if (!matched) printLine("(no matches)");
+});
+
+// --- FIND (search for a file/dir name recursively from a root) ---------------
+registerCommand(["find"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: find <name> [startPath]", "err");
+    return;
+  }
+  const needle = args[0].toLowerCase();
+  const startPath = args[1] ? resolvePathInput(args[1]) : cwdPath;
+  const startNode = resolveNode(startPath);
+  if (!startNode) {
+    printLine("The system cannot find the path specified.", "err");
+    return;
+  }
+
+  let results = [];
+  function walk(node, pathArr) {
+    if (node.type === "dir") {
+      for (const [name, child] of Object.entries(node.children || {})) {
+        const childPath = [...pathArr, name];
+        if (name.toLowerCase().includes(needle)) {
+          results.push(pathToString(childPath));
+        }
+        walk(child, childPath);
+      }
+    }
+  }
+  walk(startNode, startPath);
+
+  if (results.length === 0) {
+    printLine("(no matches)");
+  } else {
+    results.forEach(r => printLine(r));
+  }
+});
+
+// --- KILL (remove a fake process by PID) --------------------------------------
+registerCommand(["kill"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: kill <pid>", "err");
+    return;
+  }
+  const pid = parseInt(args[0], 10);
+  const before = processTable.length;
+  processTable = processTable.filter(p => p.pid !== pid);
+  if (processTable.length === before) {
+    printLine(`No such process: ${pid}`, "err");
+  } else {
+    printLine(`Terminated process ${pid}.`);
+  }
+});
+
+// --- CHMOD (fake permission tag stored on the file node) ----------------------
+registerCommand(["chmod"], (args) => {
+  if (args.length < 2) {
+    printLine("Usage: chmod <mode> <file>", "err");
+    return;
+  }
+  const target = resolvePathInput(args[1]);
+  const node = resolveNode(target);
+  if (!node) {
+    printLine(`File not found: ${args[1]}`, "err");
+    return;
+  }
+  node.mode = args[0];
+  saveFilesystem();
+  printLine(`Mode of ${args[1]} changed to ${args[0]}`);
+});
+
+// --- TOUCH (create an empty file, or no-op if it already exists) ---------------
+registerCommand(["touch"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: touch <file>", "err");
+    return;
+  }
+  const target = resolvePathInput(args[0]);
+  const name = target[target.length - 1];
+  const parent = resolveNode(target.slice(0, -1));
+  if (!parent || parent.type !== "dir") {
+    printLine("The system cannot find the path specified.", "err");
+    return;
+  }
+  if (!parent.children[name]) {
+    parent.children[name] = { type: "file", content: "" };
+    saveFilesystem();
+  }
+});
+
+// --- MOVE / RENAME (mv) -----------------------------------------------------------
+registerCommand(["mv", "move"], (args) => {
+  if (args.length < 2) {
+    printLine("Usage: mv <source> <dest>", "err");
+    return;
+  }
+  const srcPath = resolvePathInput(args[0]);
+  const srcName = srcPath[srcPath.length - 1];
+  const srcParent = resolveNode(srcPath.slice(0, -1));
+  if (!srcParent || !srcParent.children[srcName]) {
+    printLine(`Source not found: ${args[0]}`, "err");
+    return;
+  }
+  const destPath = resolvePathInput(args[1]);
+  const destName = destPath[destPath.length - 1];
+  const destParent = resolveNode(destPath.slice(0, -1));
+  if (!destParent || destParent.type !== "dir") {
+    printLine("The system cannot find the path specified.", "err");
+    return;
+  }
+  destParent.children[destName] = srcParent.children[srcName];
+  delete srcParent.children[srcName];
+  saveFilesystem();
+});
+
+// --- HEAD / TAIL (first/last N lines of a file, default 10) -----------------------
+registerCommand(["head"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: head <file> [n]", "err");
+    return;
+  }
+  const node = resolveNode(resolvePathInput(args[0]));
+  if (!node || node.type !== "file") {
+    printLine(`File not found: ${args[0]}`, "err");
+    return;
+  }
+  const n = args[1] ? parseInt(args[1], 10) : 10;
+  const lines = node.content.split("\n");
+  lines.slice(0, n).forEach(l => printLine(l));
+});
+
+registerCommand(["tail"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: tail <file> [n]", "err");
+    return;
+  }
+  const node = resolveNode(resolvePathInput(args[0]));
+  if (!node || node.type !== "file") {
+    printLine(`File not found: ${args[0]}`, "err");
+    return;
+  }
+  const n = args[1] ? parseInt(args[1], 10) : 10;
+  const lines = node.content.split("\n");
+  lines.slice(Math.max(0, lines.length - n)).forEach(l => printLine(l));
+});
+
+// --- WC (word/line/char count) -----------------------------------------------------
+registerCommand(["wc"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: wc <file>", "err");
+    return;
+  }
+  const node = resolveNode(resolvePathInput(args[0]));
+  if (!node || node.type !== "file") {
+    printLine(`File not found: ${args[0]}`, "err");
+    return;
+  }
+  const lines = node.content.split("\n").length;
+  const words = node.content.trim().length === 0 ? 0 : node.content.trim().split(/\s+/).length;
+  const chars = node.content.length;
+  printLine(`  ${lines}  ${words}  ${chars}  ${args[0]}`);
+});
+
+// --- DATE / HOSTNAME ------------------------------------------------------------------
+registerCommand(["date"], () => {
+  printLine(new Date().toString());
+});
+
+registerCommand(["hostname"], () => {
+  printLine("WASDOS");
+});
+
+// --- HISTORY (list previously run commands) --------------------------------------------
+let commandHistory = [];
+registerCommand(["history"], () => {
+  if (commandHistory.length === 0) {
+    printLine("(no history yet)");
+    return;
+  }
+  commandHistory.forEach((cmd, idx) => printLine(`  ${idx + 1}  ${cmd}`));
+});
+
+// --- MAN (short manual entries for a handful of commands) -------------------------------
+const manPages = {
+  dir: "DIR/LS — list the contents of a directory.\nUsage: dir [path]  |  ls [path]",
+  cd: "CD — change or print the current directory.\nUsage: cd [path]",
+  grep: "GREP — search a file for lines containing a pattern.\nUsage: grep <pattern> <file>",
+  wget: "WGET — download a file from a URL into the current directory.\nUsage: wget <url> [-O name]",
+  curl: "CURL — fetch a URL and print its contents, or save with -o.\nUsage: curl <url> [-o name]",
+  gdown: "GDOWN — download a file from a Google Drive share link or file ID.\nUsage: gdown <url-or-id> [-O name]",
+  sudo: "SUDO — elevate privileges for the rest of this session.\nUsage: sudo <command>",
+  install: "INSTALL — fetch an HTML app/game by URL and register it for `run`.\nUsage: install <name> <url>",
+  v86: "V86 — boot a real x86 VM (v86 project, WASM) running FreeDOS.\nUsage: run v86 wasdos-operator.sh\nNote: fetches libv86.js/wasm from jsDelivr and a disk image from copy.sh."
+};
+registerCommand(["man"], (args) => {
+  const name = args[0] && args[0].toLowerCase();
+  if (!name) {
+    printLine("Usage: man <command>", "err");
+    return;
+  }
+  if (manPages[name]) {
+    printLine(manPages[name]);
+  } else {
+    printLine(`No manual entry for ${name}`, "err");
+  }
+});
+
+// ---------------------------------------------------------------
+// NETWORK DOWNLOAD COMMANDS: wget / curl / gdown
+// ---------------------------------------------------------------
+// All three share the same core: fetch a URL as text and either
+// save it into the virtual filesystem or print it to the screen.
+// Fetches are subject to normal browser CORS rules — sources like
+// raw.githubusercontent.com work; many others will block it.
+
+function guessFilenameFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split("/").filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : "downloaded.file";
+  } catch (e) {
+    return "downloaded.file";
+  }
+}
+
+async function downloadToFile(url, outputName, label) {
+  printLine(`--${label ? "  " + label : ""}  ${url}`, "info");
+  printLine(`Resolving host... connecting... downloading...`);
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      printLine(`${label || "download"} failed: HTTP ${resp.status}`, "err");
+      return;
+    }
+    const text = await resp.text();
+    const name = outputName || guessFilenameFromUrl(url);
+    const parent = resolveNode(cwdPath);
+    parent.children[name] = { type: "file", content: text };
+    saveFilesystem();
+    printLine(`Saved '${name}' [${text.length} bytes] to ${pathToString(cwdPath)}`, "info");
+  } catch (e) {
+    printLine(`${label || "download"} failed: ${e.message}`, "err");
+    printLine("Note: the source must allow cross-origin fetches (CORS).", "warn");
+  }
+}
+
+// --- WGET ---------------------------------------------------------------------------
+registerCommand(["wget"], async (args) => {
+  if (!args[0]) {
+    printLine("Usage: wget <url> [-O name]", "err");
+    return;
+  }
+  const url = args[0];
+  let outputName = null;
+  const flagIdx = args.indexOf("-O");
+  if (flagIdx !== -1 && args[flagIdx + 1]) outputName = args[flagIdx + 1];
+  await downloadToFile(url, outputName, "wget");
+});
+
+// --- CURL ---------------------------------------------------------------------------
+registerCommand(["curl"], async (args) => {
+  if (!args[0]) {
+    printLine("Usage: curl <url> [-o name]", "err");
+    return;
+  }
+  const url = args[0];
+  const flagIdx = args.indexOf("-o");
+  if (flagIdx !== -1 && args[flagIdx + 1]) {
+    await downloadToFile(url, args[flagIdx + 1], "curl");
+    return;
+  }
+  // No -o: print the fetched content straight to the terminal.
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      printLine(`curl failed: HTTP ${resp.status}`, "err");
+      return;
+    }
+    const text = await resp.text();
+    printLine(text);
+  } catch (e) {
+    printLine(`curl failed: ${e.message}`, "err");
+    printLine("Note: the source must allow cross-origin fetches (CORS).", "warn");
+  }
+});
+
+// --- GDOWN (Google Drive style downloader) --------------------------------------------
+registerCommand(["gdown"], async (args) => {
+  if (!args[0]) {
+    printLine("Usage: gdown <url-or-file-id> [-O name]", "err");
+    return;
+  }
+  let input = args[0];
+  let outputName = null;
+  const flagIdx = args.indexOf("-O");
+  if (flagIdx !== -1 && args[flagIdx + 1]) outputName = args[flagIdx + 1];
+
+  // Accept either a raw Drive file ID, or a full share link, and
+  // normalize both into a direct-download URL.
+  let fileId = input;
+  const shareMatch = input.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (shareMatch) fileId = shareMatch[1];
+
+  const directUrl = /^https?:\/\//.test(input) && !shareMatch
+    ? input
+    : `https://drive.google.com/uc?export=download&id=${fileId}`;
+
+  await downloadToFile(directUrl, outputName, "gdown");
+});
+
+// ---------------------------------------------------------------
+// APP SYSTEM: install / run / apps / uninstall
+// ---------------------------------------------------------------
+
+// --- INSTALL (fetch an HTML app/game by URL and register it) ------------------
+registerCommand(["install", "apt"], async (args) => {
+  // Support both `install <name> <url>` and Linux-flavored
+  // `apt install <name> <url>` (args[0] === "install" in that case).
+  let name, url;
+  if (args[0] && args[0].toLowerCase() === "install") {
+    name = args[1];
+    url = args[2];
+  } else {
+    name = args[0];
+    url = args[1];
+  }
+
+  if (!name || !url) {
+    printLine("Usage: install <name> <url-to-html-file>", "err");
+    printLine("       (URL must point to a raw .html file, e.g. a GitHub raw link)");
+    return;
+  }
+
+  printLine(`Fetching ${url} ...`, "info");
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      printLine(`Install failed: HTTP ${resp.status}`, "err");
+      return;
+    }
+    const html = await resp.text();
+    appRegistry[name.toLowerCase()] = {
+      url,
+      html,
+      installedAt: new Date().toISOString()
+    };
+    saveApps();
+    printLine(`Installed '${name}'. Run it with: run ${name}`, "info");
+  } catch (e) {
+    printLine(`Install failed: ${e.message}`, "err");
+    printLine("Note: the source must allow cross-origin fetches (CORS). GitHub raw URLs work.", "warn");
+  }
+});
+
+// --- APPS (list installed apps) ------------------------------------------------
+registerCommand(["apps", "ls-apps"], () => {
+  const names = Object.keys(appRegistry);
+  if (names.length === 0) {
+    printLine("(no apps installed — try: install <name> <url>)");
+    return;
+  }
+  printLine("Installed apps:");
+  for (const name of names) {
+    printLine(`  ${name}  (from ${appRegistry[name].url})`);
+  }
+});
+
+// --- UNINSTALL -------------------------------------------------------------------
+registerCommand(["uninstall", "rm-app"], (args) => {
+  const name = args[0] && args[0].toLowerCase();
+  if (!name || !appRegistry[name]) {
+    printLine("Usage: uninstall <name>", "err");
+    return;
+  }
+  delete appRegistry[name];
+  saveApps();
+  printLine(`Uninstalled '${name}'.`);
+});
+
+// --- RUN / EXEC (launch an installed app in the overlay) --------------------------
+registerCommand(["run", "exec"], (args) => {
+  const name = args[0] && args[0].toLowerCase();
+
+  // Easter egg: "run v86 wasdos-operator.sh" boots a nested copy of
+  // WASDOS itself inside the app overlay — WASDOS-ception. v86 is
+  // playing the role of a fake virtual-machine/emulator package name.
+  if (name === "v86" && args[1] && args[1].toLowerCase() === "wasdos-operator.sh") {
+    printLine("Starting v86 virtual machine...", "info");
+    printLine("Fetching v86 core + BIOS + wasdos-operator.sh (FreeDOS image)...", "info");
+    launchApp("v86 :: wasdos-operator.sh", {
+      url: "(v86 project, via jsDelivr + copy.sh)",
+      html: buildV86AppHtml(),
+      installedAt: new Date().toISOString()
+    });
+    return;
+  }
+
+  if (!name || !appRegistry[name]) {
+    printLine(`No such app: ${args[0] || ""}. Try 'apps' to list installed apps.`, "err");
+    return;
+  }
+  launchApp(name, appRegistry[name]);
+});
+
+// Builds a standalone HTML page that boots a REAL x86 virtual machine
+// using the v86 project (github.com/copy/v86) — a genuine WASM-based
+// PC emulator, not a WASDOS simulation. Core files (libv86.js, the
+// wasm binary, BIOS images) come from the v86 npm package via
+// jsDelivr; the bootable disk is a small FreeDOS floppy image hosted
+// by the v86 project itself at k.copy.sh. All fetches happen inside
+// the sandboxed app iframe, driven by v86's own loader — WASDOS just
+// supplies the URLs.
+function buildV86AppHtml() {
+  const V86_BASE = "https://cdn.jsdelivr.net/npm/v86@latest";
+  const FREEDOS_IMG = "https://k.copy.sh/freedos722.img";
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin:0; height:100%; background:#000; color:#33ff33; font-family: monospace; }
+  #status { padding:8px 10px; font-size:13px; border-bottom:1px solid #33ff33; }
+  #screen_container { padding:10px; }
+  #screen_container div { white-space:pre; font:14px monospace; line-height:14px; color:#ccc; }
+  #err { color:#ff5555; padding:10px; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+  <div id="status">Booting wasdos-operator.sh (FreeDOS) via v86 — fetching core + BIOS + disk image...</div>
+  <div id="screen_container">
+    <div></div>
+    <canvas style="display:none"></canvas>
+  </div>
+  <div id="err"></div>
+
+  <script>
+    function showError(msg) {
+      document.getElementById("status").textContent = "v86 failed to start.";
+      document.getElementById("err").textContent = msg;
+    }
+  <\/script>
+  <script src="${V86_BASE}/build/libv86.js" onerror="showError('Could not load libv86.js from jsDelivr. Check network/CORS.')"><\/script>
+  <script>
+    window.addEventListener("load", function () {
+      try {
+        const Ctor = window.V86 || window.V86Starter;
+        if (!Ctor) {
+          showError("libv86.js loaded but did not expose V86/V86Starter.");
+          return;
+        }
+        const emulator = new Ctor({
+          wasm_path: "${V86_BASE}/build/v86.wasm",
+          memory_size: 32 * 1024 * 1024,
+          vga_memory_size: 2 * 1024 * 1024,
+          screen_container: document.getElementById("screen_container"),
+          bios: { url: "${V86_BASE}/bios/seabios.bin" },
+          vga_bios: { url: "${V86_BASE}/bios/vgabios.bin" },
+          fda: { url: "${FREEDOS_IMG}" },
+          autostart: true,
+        });
+        emulator.add_listener("emulator-ready", function () {
+          document.getElementById("status").textContent = "wasdos-operator.sh :: FreeDOS running via v86.";
+        });
+      } catch (e) {
+        showError(String(e && e.message || e));
+      }
+    });
+  <\/script>
+</body>
+</html>`;
+}
+
+function launchApp(name, app) {
+  const overlay = document.getElementById("appOverlay");
+  const frame = document.getElementById("appFrame");
+  const titleText = document.getElementById("appTitleText");
+
+  titleText.textContent = name;
+  frame.srcdoc = app.html;
+  overlay.style.display = "flex";
+
+  // Register a fake process for this running app.
+  processTable.push({ pid: nextPid++, name: `app:${name}` });
+}
+
+function closeApp() {
+  const overlay = document.getElementById("appOverlay");
+  const frame = document.getElementById("appFrame");
+  overlay.style.display = "none";
+  frame.srcdoc = "";
+  // Refocus the terminal input so typing resumes immediately.
+  const active = document.getElementById("cmdInput");
+  if (active) active.focus();
+}
+
+document.getElementById("appCloseBtn").addEventListener("click", closeApp);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const overlay = document.getElementById("appOverlay");
+    if (overlay.style.display === "flex") closeApp();
+  }
+});
+
+// ---------------------------------------------------------------
+// 6. SHELL — parses a line of input and dispatches to a command.
+// ---------------------------------------------------------------
+
+function runCommand(line) {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) return;
+
+  commandHistory.push(trimmed);
+
+  // Split into command + args, respecting simple quoted strings.
+  const parts = trimmed.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+  const cmdName = parts[0].toLowerCase();
+  const args = parts.slice(1).map(a => a.replace(/^"|"$/g, ""));
+
+  const handler = commands[cmdName];
+  if (!handler) {
+    printLine(`'${cmdName}' is not recognized as an internal or external command.`, "err");
+    return;
+  }
+  handler(args);
+}
+
+// ---------------------------------------------------------------
+// 7. BOOT SEQUENCE + TERMINAL WIRING
+// ---------------------------------------------------------------
+
+function currentPromptString() {
+  return pathToString(cwdPath) + (isElevated ? "# " : "> ");
+}
+
+// ---------------------------------------------------------------
+// AUTH STATE MACHINE
+// ---------------------------------------------------------------
+// shellMode controls what a typed line means:
+//  "normal"            -> runs as a WASDOS command
+//  "register_username" -> first line typed becomes the new username
+//  "register_password" -> first line typed becomes the new password
+//  "register_confirm"  -> must re-type the password to confirm
+//  "login_password"     -> must type the existing password to log in
+//
+// pendingUsername / pendingPassword hold values between steps.
+
+let shellMode = "normal";
+let pendingUsername = "";
+let pendingPassword = "";
+let loggedInUsername = "";
+
+// Renders one input line. `masked` = true shows a password-style
+// input (dots) instead of plain text — used during password steps.
+function renderInputLine(promptText, masked, onSubmit) {
+  const line = document.createElement("div");
+  line.id = "inputLine";
+
+  const promptSpan = document.createElement("span");
+  promptSpan.id = "prompt";
+  promptSpan.textContent = promptText !== undefined ? promptText : currentPromptString();
+
+  const input = document.createElement("input");
+  input.type = masked ? "password" : "text";
+  input.id = "cmdInput";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+
+  line.appendChild(promptSpan);
+  line.appendChild(input);
+  screenEl.appendChild(line);
+  input.focus();
+  screenEl.scrollTop = screenEl.scrollHeight;
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const value = input.value;
+      // Echo the typed line (mask it if this was a password field).
+      printLine(promptSpan.textContent + (masked ? "*".repeat(value.length) : value));
+      line.remove();
+      if (onSubmit) {
+        onSubmit(value);
+      } else {
+        runCommand(value);
+        renderInputLine();
+      }
+    }
+  });
+}
+
+// --- Registration flow (first run, no saved account) -------------------
+
+function askUsername() {
+  renderInputLine("New username: ", false, (value) => {
+    if (!value.trim()) {
+      printLine("Username cannot be empty.", "err");
+      askUsername();
+      return;
+    }
+    pendingUsername = value.trim();
+    shellMode = "register_password";
+    askNewPassword();
+  });
+}
+
+function askNewPassword() {
+  renderInputLine("New password: ", true, (pw) => {
+    if (!pw) {
+      printLine("Password cannot be empty.", "err");
+      askNewPassword();
+      return;
+    }
+    pendingPassword = pw;
+    shellMode = "register_confirm";
+    renderInputLine("Confirm password: ", true, (pw2) => {
+      if (pw2 !== pendingPassword) {
+        printLine("Passwords did not match. Let's try again.", "err");
+        startRegistration();
+        return;
+      }
+      saveUser(pendingUsername, pendingPassword);
+      loggedInUsername = pendingUsername;
+      shellMode = "normal";
+      printLine(`Account created. Welcome, ${pendingUsername}.`, "info");
+      printLine("");
+      offerOperatorInstall();
+    });
+  });
+}
+
+function startRegistration() {
+  shellMode = "register_username";
+  printLine("No account found on this device.", "info");
+  printLine("Let's set one up. This stays local to your browser only.");
+  askUsername();
+}
+
+// --- Login flow (returning user) ----------------------------------------
+
+function startLogin(account) {
+  shellMode = "login_password";
+  printLine(`Welcome back, ${account.username}.`);
+  renderInputLine("Password: ", true, (pw) => {
+    if (pw !== account.password) {
+      printLine("Incorrect password. Try again.", "err");
+      startLogin(account);
+      return;
+    }
+    loggedInUsername = account.username;
+    shellMode = "normal";
+    printLine("Login successful.", "info");
+    printLine("");
+    printLine("Type HELP to see available commands.", "info");
+    printLine("");
+    renderInputLine();
+  });
+}
+
+// After first-time registration, offer the themed "install" moment —
+// purely cosmetic, mirrors `sudo apt-install wasdos-operator.sh`.
+function offerOperatorInstall() {
+  printLine("Tip: run 'sudo apt-install wasdos-operator.sh' to finish setting up WASDOS.", "info");
+  printLine("");
+  printLine("Type HELP to see available commands.", "info");
+  printLine("");
+  renderInputLine();
+}
+
+function bootSequence() {
+  const bootLines = [
+    "WASDOS BIOS v0.1.0",
+    "Detecting virtual hardware... OK",
+    "Mounting virtual filesystem... OK",
+    "Loading kernel.sys... OK",
+    ""
+  ];
+  let i = 0;
+  const interval = setInterval(() => {
+    if (i < bootLines.length) {
+      printLine(bootLines[i]);
+      i++;
+    } else {
+      clearInterval(interval);
+      const account = loadUser();
+      if (account) {
+        startLogin(account);
+      } else {
+        startRegistration();
+      }
+    }
+  }, 150);
+}
+
+// Keep the terminal focused whenever the page is clicked.
+document.addEventListener("click", () => {
+  const active = document.getElementById("cmdInput");
+  if (active) active.focus();
+});
+
+bootSequence();
+</script>
+</body>
+</html>
