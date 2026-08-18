@@ -12,7 +12,7 @@
     margin: 0;
     padding: 0;
     background: #000;
-    color: #33ff33;
+    color: #e8e8e8;
     font-family: "Consolas", "Courier New", monospace;
     font-size: 16px;
     height: 100%;
@@ -35,7 +35,7 @@
 
   #prompt {
     white-space: pre;
-    color: #33ff33;
+    color: #e8e8e8;
   }
 
   #cmdInput {
@@ -43,10 +43,10 @@
     background: transparent;
     border: none;
     outline: none;
-    color: #33ff33;
+    color: #e8e8e8;
     font-family: inherit;
     font-size: inherit;
-    caret-color: #33ff33;
+    caret-color: #e8e8e8;
     margin-left: 4px;
   }
 
@@ -68,8 +68,8 @@
     justify-content: space-between;
     align-items: center;
     background: #111;
-    color: #33ff33;
-    border-bottom: 1px solid #33ff33;
+    color: #e8e8e8;
+    border-bottom: 1px solid #e8e8e8;
     padding: 6px 10px;
     font-size: 14px;
   }
@@ -135,22 +135,25 @@ function defaultFilesystem() {
   return {
     type: "dir",
     children: {
-      "C:": {
+      "home": {
         type: "dir",
         children: {
-          "README.txt": {
-            type: "file",
-            content: "Welcome to WASDOS.\nType HELP or help to see available commands.\n"
-          },
-          "SYSTEM": {
+          "wasdos": {
             type: "dir",
             children: {
-              "kernel.sys": { type: "file", content: "[fake kernel image]" }
-            }
-          },
-          "Users": {
-            type: "dir",
-            children: {
+              "README.txt": {
+                type: "file",
+                content: "Welcome to WASDOS.\nType HELP or help to see available commands.\n"
+              },
+              "system": {
+                type: "dir",
+                children: {
+                  "kernel.sys": { type: "file", content: "[fake kernel image]" }
+                }
+              },
+              // Placeholder home dir, present until the real account
+              // is created. ensureUserHome() renames this to the
+              // actual username the first time someone registers.
               "lera": {
                 type: "dir",
                 children: {
@@ -186,8 +189,8 @@ function saveFilesystem() {
 }
 
 // Current working directory, stored as an array of path segments.
-// e.g. ["C:", "Users", "lera"]
-let cwdPath = ["C:", "Users", "lera"];
+// e.g. ["home", "wasdos", "lera"]
+let cwdPath = ["home", "wasdos"];
 
 // Resolve a path array to the actual node object in the FS tree.
 function resolveNode(pathArr) {
@@ -199,9 +202,9 @@ function resolveNode(pathArr) {
   return node;
 }
 
-// Turn a path array into a display string like C:\Users\lera
+// Turn a path array into a display string like home/wasdos/lera
 function pathToString(pathArr) {
-  return pathArr.join("\\");
+  return pathArr.join("/");
 }
 
 // Resolve a user-typed path (relative or absolute, DOS or Unix
@@ -209,12 +212,13 @@ function pathToString(pathArr) {
 function resolvePathInput(input) {
   if (!input || input === ".") return [...cwdPath];
 
-  // Normalize slashes: both / and \ are accepted.
-  const normalized = input.replace(/\//g, "\\");
-  const isAbsolute = /^[A-Za-z]:/.test(normalized);
+  // Normalize slashes: both / and \ are accepted, everything
+  // becomes forward slashes internally (Unix-style now).
+  const normalized = input.replace(/\\/g, "/");
+  const isAbsolute = normalized.startsWith("/");
 
   let base = isAbsolute ? [] : [...cwdPath];
-  const parts = normalized.split("\\").filter(p => p.length > 0);
+  const parts = normalized.split("/").filter(p => p.length > 0);
 
   for (const part of parts) {
     if (part === "..") {
@@ -304,9 +308,9 @@ if (!appRegistry["demo"]) {
     html: `<!DOCTYPE html><html><head><style>
       body{margin:0;height:100vh;display:flex;flex-direction:column;
         align-items:center;justify-content:center;background:#111;
-        color:#33ff33;font-family:monospace;}
+        color:#e8e8e8;font-family:monospace;}
       button{font-family:monospace;font-size:20px;padding:10px 20px;
-        background:#000;color:#33ff33;border:2px solid #33ff33;cursor:pointer;}
+        background:#000;color:#e8e8e8;border:2px solid #e8e8e8;cursor:pointer;}
       </style></head><body>
       <h1>WASDOS Demo App</h1>
       <p id="count">Clicks: 0</p>
@@ -401,6 +405,17 @@ registerCommand(["help", "?"], () => {
   printLine("  curl    / curl      fetch a URL (print, or -o to save)");
   printLine("  gdown   / gdown     download from a Google Drive link/ID");
   printLine("  run v86 wasdos-operator.sh   boot a real x86 VM (v86, FreeDOS) in-browser");
+  printLine("  chown   / chown     tag a file with an owner");
+  printLine("  df      / df        show fake disk usage");
+  printLine("  du      / du        show size of a file/folder");
+  printLine("  top     / top       one-shot fake process/resource snapshot");
+  printLine("  su      / su        switch active user (local, no auth)");
+  printLine("  passwd  / passwd    change your stored password");
+  printLine("  alias   / alias     define a session command alias");
+  printLine("  export  / export    set a fake environment variable");
+  printLine("  env     / env       list environment variables");
+  printLine("  which   / which     show if a command exists");
+  printLine("  uptime  / uptime    show session uptime");
 });
 
 // --- LIST DIRECTORY (dir / ls) -----------------------------------
@@ -857,6 +872,146 @@ registerCommand(["hostname"], () => {
   printLine("WASDOS");
 });
 
+// --- CHOWN (fake ownership tag stored on the file node) -------------------------------
+registerCommand(["chown"], (args) => {
+  if (args.length < 2) {
+    printLine("Usage: chown <owner> <file>", "err");
+    return;
+  }
+  const node = resolveNode(resolvePathInput(args[1]));
+  if (!node) {
+    printLine(`File not found: ${args[1]}`, "err");
+    return;
+  }
+  node.owner = args[0];
+  saveFilesystem();
+  printLine(`Changed ownership of ${args[1]} to ${args[0]}`);
+});
+
+// --- DF / DU (fake disk usage) ---------------------------------------------------------
+registerCommand(["df"], () => {
+  printLine("Filesystem      Size  Used  Avail  Use%  Mounted on");
+  printLine("wasdos-vfs      64M   3M    61M    5%    /");
+});
+
+registerCommand(["du"], (args) => {
+  const targetPath = args[0] ? resolvePathInput(args[0]) : cwdPath;
+  const node = resolveNode(targetPath);
+  if (!node) {
+    printLine(`No such file or directory: ${args[0] || pathToString(targetPath)}`, "err");
+    return;
+  }
+  function sizeOf(n) {
+    if (n.type === "file") return n.content.length;
+    let total = 0;
+    for (const child of Object.values(n.children || {})) total += sizeOf(child);
+    return total;
+  }
+  const bytes = sizeOf(node);
+  printLine(`${Math.max(1, Math.ceil(bytes / 1024))}K\t${pathToString(targetPath)}`);
+});
+
+// --- TOP (fake process/resource monitor, one-shot snapshot) ----------------------------
+registerCommand(["top"], () => {
+  printLine("WASDOS top — press any key + Enter to return to shell");
+  printLine("");
+  printLine("PID   USER      CPU%  MEM%  COMMAND");
+  processTable.forEach(p => {
+    const cpu = (Math.random() * 8).toFixed(1);
+    const mem = (Math.random() * 5).toFixed(1);
+    printLine(`${String(p.pid).padEnd(6)}${(loggedInUsername || "lera").padEnd(10)}${cpu.padEnd(6)}${mem.padEnd(6)}${p.name}`);
+  });
+});
+
+// --- SU (switch user — just relabels the session, local/no-auth) -----------------------
+registerCommand(["su"], (args) => {
+  const target = args[0] || "lera";
+  loggedInUsername = target;
+  ensureUserHome(target);
+  printLine(`Switched to user '${target}'.`, "info");
+});
+
+// --- PASSWD (change the stored local password) -----------------------------------------
+registerCommand(["passwd"], (args) => {
+  if (!args[0]) {
+    printLine("Usage: passwd <newpassword>", "err");
+    return;
+  }
+  const account = loadUser();
+  const username = (account && account.username) || loggedInUsername || "lera";
+  saveUser(username, args[0]);
+  printLine("Password updated.", "info");
+});
+
+// --- ALIAS (fake, session-only — WASDOS commands already have DOS+Linux names) ----------
+let userAliases = {};
+registerCommand(["alias"], (args) => {
+  if (args.length === 0) {
+    const entries = Object.entries(userAliases);
+    if (entries.length === 0) {
+      printLine("(no aliases set)");
+      return;
+    }
+    entries.forEach(([k, v]) => printLine(`alias ${k}='${v}'`));
+    return;
+  }
+  const joined = args.join(" ");
+  const match = joined.match(/^([^=]+)=(.+)$/);
+  if (!match) {
+    printLine("Usage: alias name='command'", "err");
+    return;
+  }
+  const aliasName = match[1].trim();
+  const aliasCmd = match[2].replace(/^['"]|['"]$/g, "");
+  userAliases[aliasName] = aliasCmd;
+  commands[aliasName.toLowerCase()] = (a) => runCommand(aliasCmd + " " + a.join(" "));
+  printLine(`alias ${aliasName}='${aliasCmd}'`);
+});
+
+// --- EXPORT / ENV (fake session environment variables) ----------------------------------
+let envVars = { HOME: "", SHELL: "wasdos-shell", OS: "WASDOS" };
+registerCommand(["export"], (args) => {
+  if (args.length === 0) {
+    Object.entries(envVars).forEach(([k, v]) => printLine(`${k}=${v}`));
+    return;
+  }
+  const joined = args.join(" ");
+  const match = joined.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+  if (!match) {
+    printLine("Usage: export NAME=value", "err");
+    return;
+  }
+  envVars[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
+});
+
+registerCommand(["env"], () => {
+  envVars.HOME = pathToString(["home", "wasdos", loggedInUsername || "lera"]);
+  Object.entries(envVars).forEach(([k, v]) => printLine(`${k}=${v}`));
+});
+
+// --- WHICH (report whether a command exists) ---------------------------------------------
+registerCommand(["which"], (args) => {
+  const name = args[0] && args[0].toLowerCase();
+  if (!name) {
+    printLine("Usage: which <command>", "err");
+    return;
+  }
+  if (commands[name]) {
+    printLine(`/home/wasdos/bin/${name}`);
+  } else {
+    printLine(`which: no ${name} in WASDOS`, "err");
+  }
+});
+
+// --- UPTIME (fake, based on time since page load) -----------------------------------------
+const bootTime = Date.now();
+registerCommand(["uptime"], () => {
+  const seconds = Math.floor((Date.now() - bootTime) / 1000);
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  printLine(`up ${mins}m ${secs}s, 1 user, load average: 0.00, 0.00, 0.00`);
+});
+
 // --- HISTORY (list previously run commands) --------------------------------------------
 let commandHistory = [];
 registerCommand(["history"], () => {
@@ -1106,8 +1261,8 @@ function buildV86AppHtml() {
 <head>
 <meta charset="utf-8">
 <style>
-  html, body { margin:0; height:100%; background:#000; color:#33ff33; font-family: monospace; }
-  #status { padding:8px 10px; font-size:13px; border-bottom:1px solid #33ff33; }
+  html, body { margin:0; height:100%; background:#000; color:#e8e8e8; font-family: monospace; }
+  #status { padding:8px 10px; font-size:13px; border-bottom:1px solid #e8e8e8; }
   #screen_container { padding:10px; }
   #screen_container div { white-space:pre; font:14px monospace; line-height:14px; color:#ccc; }
   #err { color:#ff5555; padding:10px; white-space:pre-wrap; }
@@ -1212,18 +1367,19 @@ function runCommand(line) {
   handler(args);
 }
 
-// Makes sure C:\Users\<username> exists and becomes the working
+// Makes sure home/wasdos/<username> exists and becomes the working
 // directory, regardless of who's logged in. If this is the very
 // first login and the filesystem still has the placeholder "lera"
 // folder from defaultFilesystem(), we rename it (keeping its
 // contents) rather than leaving a stray folder with the wrong name.
 function ensureUserHome(username) {
-  const usersNode = resolveNode(["C:", "Users"]);
+  const usersNode = resolveNode(["home", "wasdos"]);
   if (!usersNode || usersNode.type !== "dir") return;
 
   if (!usersNode.children[username]) {
-    if (usersNode.children["lera"] && Object.keys(usersNode.children).length === 1) {
-      // Only the untouched placeholder exists — migrate it.
+    if (usersNode.children["lera"] && username !== "lera") {
+      // Untouched placeholder from a fresh install — migrate it
+      // rather than leaving a stray "lera" folder behind.
       usersNode.children[username] = usersNode.children["lera"];
       delete usersNode.children["lera"];
     } else {
@@ -1232,7 +1388,7 @@ function ensureUserHome(username) {
     saveFilesystem();
   }
 
-  cwdPath = ["C:", "Users", username];
+  cwdPath = ["home", "wasdos", username];
 }
 
 // ---------------------------------------------------------------
@@ -1240,7 +1396,7 @@ function ensureUserHome(username) {
 // ---------------------------------------------------------------
 
 function currentPromptString() {
-  return pathToString(cwdPath) + (isElevated ? "# " : "> ");
+  return pathToString(cwdPath) + (isElevated ? "# " : "$ ");
 }
 
 // ---------------------------------------------------------------
