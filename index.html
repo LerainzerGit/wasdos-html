@@ -1065,16 +1065,58 @@ function guessFilenameFromUrl(url) {
   }
 }
 
+// ---------------------------------------------------------------
+// JSONP FETCHER (works even where fetch()/XHR can't do cross-origin)
+// ---------------------------------------------------------------
+// Xbox Edge's sandboxed browser doesn't reliably support cross-origin
+// fetch()/XHR, regardless of what CORS headers the target sends. A
+// <script src> tag, however, loads cross-origin content just fine —
+// browsers only gate *reading* a fetch response, not loading/running
+// a script. So instead of fetch(), we route all downloads through
+// allOrigins' JSONP endpoint: it fetches the target URL server-side
+// and hands the content back to us via a JS callback, delivered as a
+// <script> tag. No fetch(), no CORS involved on our end at all.
+function jsonpFetchText(targetUrl, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const cbName = "wasdos_jsonp_" + Math.random().toString(36).slice(2);
+    const script = document.createElement("script");
+    let timeoutId;
+
+    function cleanup() {
+      clearTimeout(timeoutId);
+      delete window[cbName];
+      script.remove();
+    }
+
+    window[cbName] = (data) => {
+      cleanup();
+      if (data && typeof data.contents === "string") {
+        resolve(data.contents);
+      } else {
+        reject(new Error("Proxy returned an unexpected response shape."));
+      }
+    };
+
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("Proxy script failed to load (network or proxy outage)."));
+    };
+
+    script.src = `https://api.allorigins.win/get?callback=${cbName}&url=${encodeURIComponent(targetUrl)}`;
+    timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new Error("Request timed out."));
+    }, timeoutMs || 20000);
+
+    document.head.appendChild(script);
+  });
+}
+
 async function downloadToFile(url, outputName, label) {
   printLine(`--${label ? "  " + label : ""}  ${url}`, "info");
-  printLine(`Resolving host... connecting... downloading...`);
+  printLine(`Resolving host... connecting... downloading (via JSONP proxy)...`);
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      printLine(`${label || "download"} failed: HTTP ${resp.status}`, "err");
-      return;
-    }
-    const text = await resp.text();
+    const text = await jsonpFetchText(url);
     const name = outputName || guessFilenameFromUrl(url);
     const parent = resolveNode(cwdPath);
     parent.children[name] = { type: "file", content: text };
@@ -1082,7 +1124,6 @@ async function downloadToFile(url, outputName, label) {
     printLine(`Saved '${name}' [${text.length} bytes] to ${pathToString(cwdPath)}`, "info");
   } catch (e) {
     printLine(`${label || "download"} failed: ${e.message}`, "err");
-    printLine("Note: the source must allow cross-origin fetches (CORS).", "warn");
   }
 }
 
@@ -1113,16 +1154,10 @@ registerCommand(["curl"], async (args) => {
   }
   // No -o: print the fetched content straight to the terminal.
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      printLine(`curl failed: HTTP ${resp.status}`, "err");
-      return;
-    }
-    const text = await resp.text();
+    const text = await jsonpFetchText(url);
     printLine(text);
   } catch (e) {
     printLine(`curl failed: ${e.message}`, "err");
-    printLine("Note: the source must allow cross-origin fetches (CORS).", "warn");
   }
 });
 
@@ -1175,12 +1210,7 @@ registerCommand(["install", "apt"], async (args) => {
 
   printLine(`Fetching ${url} ...`, "info");
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      printLine(`Install failed: HTTP ${resp.status}`, "err");
-      return;
-    }
-    const html = await resp.text();
+    const html = await jsonpFetchText(url);
     appRegistry[name.toLowerCase()] = {
       url,
       html,
@@ -1190,7 +1220,6 @@ registerCommand(["install", "apt"], async (args) => {
     printLine(`Installed '${name}'. Run it with: run ${name}`, "info");
   } catch (e) {
     printLine(`Install failed: ${e.message}`, "err");
-    printLine("Note: the source must allow cross-origin fetches (CORS). GitHub raw URLs work.", "warn");
   }
 });
 
